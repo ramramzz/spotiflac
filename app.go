@@ -1183,3 +1183,327 @@ func (a *App) CheckFFmpegInstalled() (bool, error) {
 func (a *App) GetOSInfo() (string, error) {
 	return backend.GetOSInfo()
 }
+
+// Spotify Library Integration
+
+type SpotifyAuthStatus struct {
+	IsAuthenticated bool                        `json:"is_authenticated"`
+	User            *backend.SpotifyUserProfile `json:"user,omitempty"`
+}
+
+func (a *App) GetSpotifyAuthStatus() (SpotifyAuthStatus, error) {
+	client := backend.NewSpotifyAuthClient()
+	status := SpotifyAuthStatus{
+		IsAuthenticated: client.IsAuthenticated(),
+	}
+
+	if status.IsAuthenticated {
+		profile, err := client.GetUserProfile()
+		if err == nil {
+			status.User = profile
+		}
+	}
+
+	return status, nil
+}
+
+func (a *App) GetSpotifyAuthURL() (string, error) {
+	client := backend.NewSpotifyAuthClient()
+	return client.GetAuthURL()
+}
+
+func (a *App) StartSpotifyAuth() (string, error) {
+	client := backend.NewSpotifyAuthClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	code, err := client.StartAuthFlow(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	if err := client.ExchangeCode(code); err != nil {
+		return "", err
+	}
+
+	profile, err := client.GetUserProfile()
+	if err != nil {
+		return "", err
+	}
+
+	return profile.DisplayName, nil
+}
+
+func (a *App) ExchangeSpotifyCode(code string) error {
+	client := backend.NewSpotifyAuthClient()
+	return client.ExchangeCode(code)
+}
+
+func (a *App) LogoutSpotify() error {
+	client := backend.NewSpotifyAuthClient()
+	return client.Logout()
+}
+
+type SpotifyUserProfileResponse struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Email       string `json:"email"`
+	ImageURL    string `json:"image_url"`
+	Country     string `json:"country"`
+	Product     string `json:"product"`
+}
+
+func (a *App) GetSpotifyUserProfile() (*SpotifyUserProfileResponse, error) {
+	client := backend.NewSpotifyAuthClient()
+	profile, err := client.GetUserProfile()
+	if err != nil {
+		return nil, err
+	}
+
+	imageURL := ""
+	if len(profile.Images) > 0 {
+		imageURL = profile.Images[0].URL
+	}
+
+	return &SpotifyUserProfileResponse{
+		ID:          profile.ID,
+		DisplayName: profile.DisplayName,
+		Email:       profile.Email,
+		ImageURL:    imageURL,
+		Country:     profile.Country,
+		Product:     profile.Product,
+	}, nil
+}
+
+type LikedSongsResponse struct {
+	Tracks []LibraryTrack `json:"tracks"`
+	Total  int            `json:"total"`
+}
+
+type LibraryTrack struct {
+	ID          string   `json:"id"`
+	SpotifyID   string   `json:"spotify_id"`
+	Name        string   `json:"name"`
+	Artists     string   `json:"artists"`
+	ArtistIDs   []string `json:"artist_ids"`
+	Album       string   `json:"album"`
+	AlbumID     string   `json:"album_id"`
+	AlbumArtist string   `json:"album_artist"`
+	Duration    string   `json:"duration"`
+	DurationMs  int      `json:"duration_ms"`
+	CoverURL    string   `json:"cover_url"`
+	ISRC        string   `json:"isrc"`
+	TrackNumber int      `json:"track_number"`
+	DiscNumber  int      `json:"disc_number"`
+	TotalTracks int      `json:"total_tracks"`
+	ReleaseDate string   `json:"release_date"`
+	AddedAt     string   `json:"added_at"`
+	Explicit    bool     `json:"explicit"`
+}
+
+func (a *App) GetSpotifyLikedSongs(limit, offset int) (*LikedSongsResponse, error) {
+	client := backend.NewSpotifyAuthClient()
+	resp, err := client.GetLikedSongs(limit, offset)
+	if err != nil {
+		return nil, err
+	}
+
+	tracks := make([]LibraryTrack, 0, len(resp.Items))
+	for _, item := range resp.Items {
+		track := item.Track
+
+		artistNames := make([]string, len(track.Artists))
+		artistIDs := make([]string, len(track.Artists))
+		for i, artist := range track.Artists {
+			artistNames[i] = artist.Name
+			artistIDs[i] = artist.ID
+		}
+
+		albumArtistNames := make([]string, len(track.Album.Artists))
+		for i, artist := range track.Album.Artists {
+			albumArtistNames[i] = artist.Name
+		}
+
+		coverURL := ""
+		if len(track.Album.Images) > 0 {
+			coverURL = track.Album.Images[0].URL
+		}
+
+		totalSeconds := track.DurationMs / 1000
+		duration := fmt.Sprintf("%d:%02d", totalSeconds/60, totalSeconds%60)
+
+		tracks = append(tracks, LibraryTrack{
+			ID:          track.ID,
+			SpotifyID:   track.ID,
+			Name:        track.Name,
+			Artists:     strings.Join(artistNames, ", "),
+			ArtistIDs:   artistIDs,
+			Album:       track.Album.Name,
+			AlbumID:     track.Album.ID,
+			AlbumArtist: strings.Join(albumArtistNames, ", "),
+			Duration:    duration,
+			DurationMs:  track.DurationMs,
+			CoverURL:    coverURL,
+			ISRC:        track.ExternalIDs.ISRC,
+			TrackNumber: track.TrackNumber,
+			DiscNumber:  track.DiscNumber,
+			TotalTracks: track.Album.TotalTracks,
+			ReleaseDate: track.Album.ReleaseDate,
+			AddedAt:     item.AddedAt,
+			Explicit:    track.Explicit,
+		})
+	}
+
+	return &LikedSongsResponse{
+		Tracks: tracks,
+		Total:  resp.Total,
+	}, nil
+}
+
+func (a *App) GetAllSpotifyLikedSongs() (*LikedSongsResponse, error) {
+	client := backend.NewSpotifyAuthClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	items, total, err := client.GetAllLikedSongs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tracks := make([]LibraryTrack, 0, len(items))
+	for _, item := range items {
+		track := item.Track
+
+		artistNames := make([]string, len(track.Artists))
+		artistIDs := make([]string, len(track.Artists))
+		for i, artist := range track.Artists {
+			artistNames[i] = artist.Name
+			artistIDs[i] = artist.ID
+		}
+
+		albumArtistNames := make([]string, len(track.Album.Artists))
+		for i, artist := range track.Album.Artists {
+			albumArtistNames[i] = artist.Name
+		}
+
+		coverURL := ""
+		if len(track.Album.Images) > 0 {
+			coverURL = track.Album.Images[0].URL
+		}
+
+		totalSeconds := track.DurationMs / 1000
+		duration := fmt.Sprintf("%d:%02d", totalSeconds/60, totalSeconds%60)
+
+		tracks = append(tracks, LibraryTrack{
+			ID:          track.ID,
+			SpotifyID:   track.ID,
+			Name:        track.Name,
+			Artists:     strings.Join(artistNames, ", "),
+			ArtistIDs:   artistIDs,
+			Album:       track.Album.Name,
+			AlbumID:     track.Album.ID,
+			AlbumArtist: strings.Join(albumArtistNames, ", "),
+			Duration:    duration,
+			DurationMs:  track.DurationMs,
+			CoverURL:    coverURL,
+			ISRC:        track.ExternalIDs.ISRC,
+			TrackNumber: track.TrackNumber,
+			DiscNumber:  track.DiscNumber,
+			TotalTracks: track.Album.TotalTracks,
+			ReleaseDate: track.Album.ReleaseDate,
+			AddedAt:     item.AddedAt,
+			Explicit:    track.Explicit,
+		})
+	}
+
+	return &LikedSongsResponse{
+		Tracks: tracks,
+		Total:  total,
+	}, nil
+}
+
+type UserPlaylist struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	OwnerName   string `json:"owner_name"`
+	OwnerID     string `json:"owner_id"`
+	CoverURL    string `json:"cover_url"`
+	TrackCount  int    `json:"track_count"`
+	Public      bool   `json:"public"`
+	SpotifyURL  string `json:"spotify_url"`
+}
+
+type UserPlaylistsResponse struct {
+	Playlists []UserPlaylist `json:"playlists"`
+	Total     int            `json:"total"`
+}
+
+func (a *App) GetSpotifyUserPlaylists(limit, offset int) (*UserPlaylistsResponse, error) {
+	client := backend.NewSpotifyAuthClient()
+	resp, err := client.GetUserPlaylists(limit, offset)
+	if err != nil {
+		return nil, err
+	}
+
+	playlists := make([]UserPlaylist, 0, len(resp.Items))
+	for _, item := range resp.Items {
+		coverURL := ""
+		if len(item.Images) > 0 {
+			coverURL = item.Images[0].URL
+		}
+
+		playlists = append(playlists, UserPlaylist{
+			ID:          item.ID,
+			Name:        item.Name,
+			Description: item.Description,
+			OwnerName:   item.Owner.DisplayName,
+			OwnerID:     item.Owner.ID,
+			CoverURL:    coverURL,
+			TrackCount:  item.Tracks.Total,
+			Public:      item.Public,
+			SpotifyURL:  item.ExternalURLs.Spotify,
+		})
+	}
+
+	return &UserPlaylistsResponse{
+		Playlists: playlists,
+		Total:     resp.Total,
+	}, nil
+}
+
+func (a *App) GetAllSpotifyUserPlaylists() (*UserPlaylistsResponse, error) {
+	client := backend.NewSpotifyAuthClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	items, total, err := client.GetAllUserPlaylists(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	playlists := make([]UserPlaylist, 0, len(items))
+	for _, item := range items {
+		coverURL := ""
+		if len(item.Images) > 0 {
+			coverURL = item.Images[0].URL
+		}
+
+		playlists = append(playlists, UserPlaylist{
+			ID:          item.ID,
+			Name:        item.Name,
+			Description: item.Description,
+			OwnerName:   item.Owner.DisplayName,
+			OwnerID:     item.Owner.ID,
+			CoverURL:    coverURL,
+			TrackCount:  item.Tracks.Total,
+			Public:      item.Public,
+			SpotifyURL:  item.ExternalURLs.Spotify,
+		})
+	}
+
+	return &UserPlaylistsResponse{
+		Playlists: playlists,
+		Total:     total,
+	}, nil
+}

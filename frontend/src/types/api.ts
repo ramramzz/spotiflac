@@ -4,10 +4,13 @@ export interface ArtistSimple {
     external_urls: string;
 }
 export interface TrackMetadata {
+    id?: string;
     artists: string;
+    artist_ids?: string[];
     name: string;
     album_name: string;
     album_artist?: string;
+    duration?: string;
     duration_ms: number;
     images: string;
     release_date: string;
@@ -28,6 +31,7 @@ export interface TrackMetadata {
     publisher?: string;
     plays?: string;
     status?: string;
+    explicit?: boolean;
 }
 export interface TrackResponse {
     track: TrackMetadata;

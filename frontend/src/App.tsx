@@ -27,6 +27,7 @@ import { SettingsPage } from "@/components/SettingsPage";
 import { DebugLoggerPage } from "@/components/DebugLoggerPage";
 import { AboutPage } from "@/components/AboutPage";
 import { HistoryPage } from "@/components/HistoryPage";
+import { SpotifyLibraryPage } from "@/components/SpotifyLibraryPage";
 import type { HistoryItem } from "@/components/FetchHistory";
 import { useDownload } from "@/hooks/useDownload";
 import { useMetadata } from "@/hooks/useMetadata";
@@ -401,6 +402,15 @@ function App() {
                 return <AboutPage version={CURRENT_VERSION}/>;
             case "history":
                 return <HistoryPage />;
+            case "spotify-library":
+                return <SpotifyLibraryPage onPlaylistSelect={async (url) => {
+                    setSpotifyUrl(url);
+                    const updatedUrl = await metadata.handleFetchMetadata(url);
+                    if (updatedUrl) {
+                        setSpotifyUrl(updatedUrl);
+                    }
+                    setCurrentPage("main");
+                }} />;
             case "audio-analysis":
                 return <AudioAnalysisPage />;
             case "audio-converter":
