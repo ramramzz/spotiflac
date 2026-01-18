@@ -1,0 +1,131 @@
+name: Build SpotiFLAC
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: .exe
+            
+          - name: macOS (Intel)
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            ext: ''
+            
+          - name: macOS (Apple Silicon)
+            os: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: ''
+            
+          - name: Linux
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ''
+
+    runs-on: ${{ matrix.os }}
+    name: Build for ${{ matrix.name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install Linux dependencies
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+
+      - name: Build application
+        run: wails build -platform ${{ matrix.goos }}/${{ matrix.goarch }}
+
+      - name: Prepare artifact name
+        id: artifact
+        shell: bash
+        run: |
+          if [ "${{ matrix.goos }}" == "darwin" ]; then
+            if [ "${{ matrix.goarch }}" == "arm64" ]; then
+              echo "name=SpotiFLAC-macOS-arm64" >> $GITHUB_OUTPUT
+              echo "file=build/bin/SpotiFLAC.app" >> $GITHUB_OUTPUT
+            else
+              echo "name=SpotiFLAC-macOS-amd64" >> $GITHUB_OUTPUT
+              echo "file=build/bin/SpotiFLAC.app" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ matrix.goos }}" == "windows" ]; then
+            echo "name=SpotiFLAC-Windows" >> $GITHUB_OUTPUT
+            echo "file=build/bin/SpotiFLAC.exe" >> $GITHUB_OUTPUT
+          else
+            echo "name=SpotiFLAC-Linux" >> $GITHUB_OUTPUT
+            echo "file=build/bin/SpotiFLAC" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package macOS app
+        if: matrix.goos == 'darwin'
+        run: |
+          cd build/bin
+          zip -r SpotiFLAC-${{ matrix.goarch }}.zip SpotiFLAC.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            build/bin/SpotiFLAC.exe
+            build/bin/SpotiFLAC
+            build/bin/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
