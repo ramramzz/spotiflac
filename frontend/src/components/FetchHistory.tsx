@@ -6,6 +6,7 @@ export interface HistoryItem {
     name: string;
     artist: string;
     image: string;
+    is_explicit?: boolean;
     timestamp: number;
 }
 interface FetchHistoryProps {
@@ -75,9 +76,12 @@ export function FetchHistory({ history, onSelect, onRemove }: FetchHistoryProps)
                   </div>)}
               </div>
               <div className="space-y-0.5">
-                <p className="text-xs font-medium truncate" title={item.name}>
-                  {item.name}
-                </p>
+                <div className="flex items-center gap-1 min-w-0">
+                  {item.is_explicit ? <span className="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded bg-red-600 text-[9px] font-bold text-white" title="Explicit">E</span> : null}
+                  <p className="min-w-0 text-xs font-medium truncate" title={item.name}>
+                    {item.name}
+                  </p>
+                </div>
                 <p className="text-xs text-muted-foreground truncate" title={item.artist}>
                   {item.artist}
                 </p>

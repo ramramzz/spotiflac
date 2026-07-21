@@ -14,10 +14,10 @@ async function generateIcon() {
             .resize(1024, 1024)
             .png()
             .toFile(outputPath);
-        console.log('✓ Icon generated:', outputPath);
+        console.log('Icon generated:', outputPath);
     }
     catch (error) {
-        console.error('✗ Failed to generate icon:', error.message);
+        console.error('Failed to generate icon:', error.message);
         process.exit(1);
     }
 }

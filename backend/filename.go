@@ -2,6 +2,7 @@ package backend
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -9,12 +10,61 @@ import (
 	"unicode/utf8"
 )
 
-func BuildExpectedFilename(trackName, artistName, albumName, albumArtist, releaseDate, filenameFormat string, includeTrackNumber bool, position, discNumber int, useAlbumTrackNumber bool) string {
+func ApplyExtraFilenameTokens(template, artists string, totalTracks, totalDiscs int) string {
+	template = strings.ReplaceAll(template, "{track_number}", "{track}")
+	template = strings.ReplaceAll(template, "{disc_number}", "{disc}")
+	template = strings.ReplaceAll(template, "{artists}", SanitizeOptionalFilename(artists))
+	if totalTracks > 0 {
+		template = strings.ReplaceAll(template, "{total_tracks}", fmt.Sprintf("%d", totalTracks))
+	} else {
+		template = strings.ReplaceAll(template, "{total_tracks}", "")
+	}
+	if totalDiscs > 0 {
+		template = strings.ReplaceAll(template, "{total_discs}", fmt.Sprintf("%d", totalDiscs))
+	} else {
+		template = strings.ReplaceAll(template, "{total_discs}", "")
+	}
+	return template
+}
 
-	safeTitle := sanitizeFilename(trackName)
-	safeArtist := sanitizeFilename(artistName)
-	safeAlbum := sanitizeFilename(albumName)
-	safeAlbumArtist := sanitizeFilename(albumArtist)
+func ApplyArtistFilenameTokens(template, artists, albumArtist string) string {
+	primaryArtist := firstArtistCredit(artists)
+	primaryAlbumArtist := firstArtistCredit(albumArtist)
+	if primaryAlbumArtist == "" {
+		primaryAlbumArtist = primaryArtist
+	}
+	template = strings.ReplaceAll(template, "{artist}", SanitizeOptionalFilename(primaryArtist))
+	template = strings.ReplaceAll(template, "{album_artist}", SanitizeOptionalFilename(primaryAlbumArtist))
+	return template
+}
+
+func ApplyFilenameContextTokens(template, category, playlist, creator, upc string) string {
+	template = strings.ReplaceAll(template, "{category}", SanitizeOptionalFilename(category))
+	template = strings.ReplaceAll(template, "{creator}", SanitizeOptionalFilename(creator))
+	template = strings.ReplaceAll(template, "{upc}", SanitizeOptionalFilename(upc))
+	return template
+}
+
+func firstArtistCredit(artistString string) string {
+	trimmed := strings.TrimSpace(artistString)
+	if trimmed == "" {
+		return trimmed
+	}
+	if before, _, found := strings.Cut(trimmed, ";"); found {
+		return strings.TrimSpace(before)
+	}
+	return GetFirstArtist(trimmed)
+}
+
+func buildFormattedFilenameBase(trackName, artistName, albumName, albumArtist, releaseDate, filenameFormat, playlistName, playlistOwner, isrc string, includeTrackNumber bool, position, discNumber int, useAlbumTrackNumber bool) string {
+	safeTitle := SanitizeFilename(trackName)
+	safeArtist := SanitizeFilename(artistName)
+	safeAlbum := SanitizeFilename(albumName)
+	safeAlbumArtist := SanitizeFilename(albumArtist)
+	safeISRC := SanitizeOptionalFilename(isrc)
+
+	safePlaylist := SanitizeFilename(playlistName)
+	safeCreator := SanitizeFilename(playlistOwner)
 
 	year := ""
 	if len(releaseDate) >= 4 {
@@ -30,6 +80,10 @@ func BuildExpectedFilename(trackName, artistName, albumName, albumArtist, releas
 		filename = strings.ReplaceAll(filename, "{album}", safeAlbum)
 		filename = strings.ReplaceAll(filename, "{album_artist}", safeAlbumArtist)
 		filename = strings.ReplaceAll(filename, "{year}", year)
+		filename = strings.ReplaceAll(filename, "{date}", SanitizeFilename(releaseDate))
+		filename = strings.ReplaceAll(filename, "{playlist}", safePlaylist)
+		filename = strings.ReplaceAll(filename, "{creator}", safeCreator)
+		filename = strings.ReplaceAll(filename, "{isrc}", safeISRC)
 
 		if discNumber > 0 {
 			filename = strings.ReplaceAll(filename, "{disc}", fmt.Sprintf("%d", discNumber))
@@ -61,10 +115,50 @@ func BuildExpectedFilename(trackName, artistName, albumName, albumArtist, releas
 		}
 	}
 
-	return filename + ".flac"
+	return filename
 }
 
-func sanitizeFilename(name string) string {
+func BuildExpectedFilename(trackName, artistName, albumName, albumArtist, releaseDate, filenameFormat, playlistName, playlistOwner string, includeTrackNumber bool, position, discNumber int, useAlbumTrackNumber bool, extra ...string) string {
+	isrc := ""
+	if len(extra) > 0 {
+		isrc = extra[0]
+	}
+
+	return buildFormattedFilenameBase(trackName, artistName, albumName, albumArtist, releaseDate, filenameFormat, playlistName, playlistOwner, isrc, includeTrackNumber, position, discNumber, useAlbumTrackNumber) + ".flac"
+}
+
+func ResolveOutputPathForDownload(path string, redownloadWithSuffix bool) (string, bool) {
+	if !redownloadWithSuffix {
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+			return path, true
+		}
+		return path, false
+	}
+
+	if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+		return path, false
+	}
+
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s_%02d%s", base, i, ext)
+		if info, err := os.Stat(candidate); err != nil || info.Size() == 0 {
+			return candidate, false
+		}
+	}
+}
+
+func mustFileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func SanitizeFilename(name string) string {
 
 	sanitized := strings.ReplaceAll(name, "/", " ")
 
@@ -113,9 +207,38 @@ func sanitizeFilename(name string) string {
 	return sanitized
 }
 
-func NormalizePath(folderPath string) string {
+func GetFirstArtist(artistString string) string {
+	if artistString == "" {
+		return ""
+	}
+	delimiters := []string{";", " feat. ", " ft. ", " featuring "}
+	for _, d := range delimiters {
+		if idx := strings.Index(strings.ToLower(artistString), d); idx != -1 {
+			return strings.TrimSpace(artistString[:idx])
+		}
+	}
+	return artistString
+}
 
+func NormalizePath(folderPath string) string {
 	return strings.ReplaceAll(folderPath, "/", string(filepath.Separator))
+}
+
+func GetSeparator() string {
+	settings, err := LoadConfigSettings()
+	if err != nil || settings == nil {
+		return "; "
+	}
+
+	if sep, ok := settings["separator"].(string); ok {
+		if sep == "comma" {
+			return ", "
+		}
+		if sep == "semicolon" {
+			return "; "
+		}
+	}
+	return "; "
 }
 
 func SanitizeFolderPath(folderPath string) string {
@@ -148,7 +271,15 @@ func SanitizeFolderPath(folderPath string) string {
 	return strings.Join(sanitizedParts, sep)
 }
 
-func sanitizeFolderName(name string) string {
+func sanitizeFolderName(name string) string { return SanitizeFilename(name) }
 
-	return sanitizeFilename(name)
+func sanitizeFilename(name string) string {
+	return SanitizeFilename(name)
+}
+
+func SanitizeOptionalFilename(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	return SanitizeFilename(name)
 }

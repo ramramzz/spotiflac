@@ -4,7 +4,7 @@ import { Label } from "@/components/ui/label";
 import { ToggleGroup, ToggleGroupItem, } from "@/components/ui/toggle-group";
 import { Upload, X, CheckCircle2, AlertCircle, Trash2, FileMusic, WandSparkles, } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
-import { ConvertAudio, SelectAudioFiles, } from "../../wailsjs/go/main/App";
+import { ConvertAudio, SelectAudioFiles, SelectFolder, ListAudioFilesInDir, } from "../../wailsjs/go/main/App";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { OnFileDrop, OnFileDropOff } from "../../wailsjs/runtime/runtime";
 interface AudioFile {
@@ -51,12 +51,12 @@ export function AudioConverterPage() {
         }
         return [];
     });
-    const [outputFormat, setOutputFormat] = useState<"mp3" | "m4a">(() => {
+    const [outputFormat, setOutputFormat] = useState<"mp3" | "m4a" | "wav" | "aiff" | "opus">(() => {
         try {
             const saved = sessionStorage.getItem(STORAGE_KEY);
             if (saved) {
                 const parsed = JSON.parse(saved);
-                if (parsed.outputFormat === "mp3" || parsed.outputFormat === "m4a") {
+                if (["mp3", "m4a", "wav", "aiff", "opus"].includes(parsed.outputFormat)) {
                     return parsed.outputFormat;
                 }
             }
@@ -98,7 +98,7 @@ export function AudioConverterPage() {
     const [isFullscreen, setIsFullscreen] = useState(false);
     const saveState = useCallback((stateToSave: {
         files: AudioFile[];
-        outputFormat: "mp3" | "m4a";
+        outputFormat: "mp3" | "m4a" | "wav" | "aiff" | "opus";
         bitrate: string;
         m4aCodec: "aac" | "alac";
     }) => {
@@ -116,7 +116,7 @@ export function AudioConverterPage() {
         if (files.length === 0)
             return;
         const allMP3 = files.every((f) => f.format === "mp3");
-        if (allMP3 && outputFormat !== "m4a") {
+        if (allMP3 && outputFormat === "mp3") {
             setOutputFormat("m4a");
         }
         const hasFlac = files.some((f) => f.format === "flac");
@@ -149,6 +149,27 @@ export function AudioConverterPage() {
         catch (err) {
             toast.error("File Selection Failed", {
                 description: err instanceof Error ? err.message : "Failed to select files",
+            });
+        }
+    };
+    const handleSelectFolder = async () => {
+        try {
+            const selectedFolder = await SelectFolder("");
+            if (selectedFolder) {
+                const folderFiles = await ListAudioFilesInDir(selectedFolder);
+                if (folderFiles && folderFiles.length > 0) {
+                    addFiles(folderFiles.map((f) => f.path));
+                }
+                else {
+                    toast.info("No audio files found", {
+                        description: "No FLAC or MP3 files found in the selected folder.",
+                    });
+                }
+            }
+        }
+        catch (err) {
+            toast.error("Folder Selection Failed", {
+                description: err instanceof Error ? err.message : "Failed to select folder",
             });
         }
     };
@@ -243,7 +264,7 @@ export function AudioConverterPage() {
                 codec: outputFormat === "m4a" ? m4aCodec : "",
             });
             setFiles((prev) => prev.map((f) => {
-                const result = results.find((r) => r.input_file === f.path);
+                const result = results.find((r) => r.input_file === f.path || r.input_file.toLowerCase() === f.path.toLowerCase());
                 if (result) {
                     return {
                         ...f,
@@ -298,7 +319,11 @@ export function AudioConverterPage() {
             {files.length > 0 && (<div className="flex gap-2">
                 <Button variant="outline" size="sm" onClick={handleSelectFiles}>
                     <Upload className="h-4 w-4"/>
-                    Add More
+                    Add Files
+                </Button>
+                <Button variant="outline" size="sm" onClick={handleSelectFolder}>
+                    <Upload className="h-4 w-4"/>
+                    Add Folder
                 </Button>
                 <Button variant="outline" size="sm" onClick={clearFiles} disabled={converting}>
                     <Trash2 className="h-4 w-4"/>
@@ -329,10 +354,16 @@ export function AudioConverterPage() {
                 ? "Drop your audio files here"
                 : "Drag and drop audio files here, or click the button below to select"}
                 </p>
-                <Button onClick={handleSelectFiles} size="lg">
-                    <Upload className="h-5 w-5"/>
-                    Select Files
-                </Button>
+                <div className="flex gap-3">
+                    <Button onClick={handleSelectFiles} size="lg">
+                        <Upload className="h-5 w-5"/>
+                        Select Files
+                    </Button>
+                    <Button onClick={handleSelectFolder} size="lg" variant="outline">
+                        <Upload className="h-5 w-5"/>
+                        Select Folder
+                    </Button>
+                </div>
                 <p className="text-xs text-muted-foreground mt-4 text-center">
                     Supported formats: FLAC, MP3
                 </p>
@@ -344,14 +375,23 @@ export function AudioConverterPage() {
                         <div className="flex items-center gap-2">
                             <Label className="whitespace-nowrap">Format:</Label>
                             <ToggleGroup type="single" variant="outline" value={outputFormat} onValueChange={(value) => {
-                if (value && !isFormatDisabled)
-                    setOutputFormat(value as "mp3" | "m4a");
-            }} disabled={isFormatDisabled}>
+                if (value)
+                    setOutputFormat(value as "mp3" | "m4a" | "wav" | "aiff" | "opus");
+            }}>
                                 {!isFormatDisabled && (<ToggleGroupItem value="mp3" aria-label="MP3">
                                     MP3
                                 </ToggleGroupItem>)}
-                                <ToggleGroupItem value="m4a" aria-label="M4A" disabled={isFormatDisabled}>
+                                <ToggleGroupItem value="m4a" aria-label="M4A">
                                     M4A
+                                </ToggleGroupItem>
+                                <ToggleGroupItem value="opus" aria-label="Opus">
+                                    Opus
+                                </ToggleGroupItem>
+                                <ToggleGroupItem value="wav" aria-label="WAV">
+                                    WAV
+                                </ToggleGroupItem>
+                                <ToggleGroupItem value="aiff" aria-label="AIFF">
+                                    AIFF
                                 </ToggleGroupItem>
                             </ToggleGroup>
                         </div>
@@ -368,7 +408,7 @@ export function AudioConverterPage() {
                             </ToggleGroup>
                         </div>)}
 
-                        {!(outputFormat === "m4a" && m4aCodec === "alac") && (<div className="flex items-center gap-2">
+                        {(outputFormat === "mp3" || outputFormat === "opus" || (outputFormat === "m4a" && m4aCodec === "aac")) && (<div className="flex items-center gap-2">
                             <Label className="whitespace-nowrap">Bitrate:</Label>
                             <ToggleGroup type="single" variant="outline" value={bitrate} onValueChange={(value) => {
                     if (value)

@@ -22,7 +22,7 @@ type DownloadItem struct {
 	TrackName    string         `json:"track_name"`
 	ArtistName   string         `json:"artist_name"`
 	AlbumName    string         `json:"album_name"`
-	ISRC         string         `json:"isrc"`
+	SpotifyID    string         `json:"spotify_id"`
 	Status       DownloadStatus `json:"status"`
 	Progress     float64        `json:"progress"`
 	TotalSize    float64        `json:"total_size"`
@@ -41,6 +41,14 @@ var (
 	currentSpeed        float64
 	speedLock           sync.RWMutex
 
+	rateLimitUntilMs int64
+	rateLimitLock    sync.RWMutex
+
+	cooldownUntilMs int64
+	cooldownMessage string
+	cooldownEventID int64
+	cooldownLock    sync.RWMutex
+
 	downloadQueue       []DownloadItem
 	downloadQueueLock   sync.RWMutex
 	currentItemID       string
@@ -52,9 +60,15 @@ var (
 )
 
 type ProgressInfo struct {
-	IsDownloading bool    `json:"is_downloading"`
-	MBDownloaded  float64 `json:"mb_downloaded"`
-	SpeedMBps     float64 `json:"speed_mbps"`
+	IsDownloading   bool    `json:"is_downloading"`
+	MBDownloaded    float64 `json:"mb_downloaded"`
+	SpeedMBps       float64 `json:"speed_mbps"`
+	RateLimited     bool    `json:"rate_limited"`
+	RateLimitSecs   int     `json:"rate_limit_secs"`
+	Cooldown        bool    `json:"cooldown"`
+	CooldownSecs    int     `json:"cooldown_secs"`
+	CooldownMessage string  `json:"cooldown_message"`
+	CooldownEventID int64   `json:"cooldown_event_id"`
 }
 
 type DownloadQueueInfo struct {
@@ -82,11 +96,85 @@ func GetDownloadProgress() ProgressInfo {
 	speed := currentSpeed
 	speedLock.RUnlock()
 
-	return ProgressInfo{
-		IsDownloading: downloading,
-		MBDownloaded:  progress,
-		SpeedMBps:     speed,
+	rateLimitLock.RLock()
+	untilMs := rateLimitUntilMs
+	rateLimitLock.RUnlock()
+
+	rateLimited := false
+	rateLimitSecs := 0
+	if untilMs > 0 {
+		remainingMs := untilMs - getCurrentTimeMillis()
+		if remainingMs > 0 {
+			rateLimited = true
+			rateLimitSecs = int((remainingMs + 999) / 1000)
+		}
 	}
+
+	cooldownLock.RLock()
+	cdUntilMs := cooldownUntilMs
+	cdMessage := cooldownMessage
+	cdEventID := cooldownEventID
+	cooldownLock.RUnlock()
+
+	cooldown := false
+	cooldownSecs := 0
+	if cdUntilMs > 0 {
+		remainingMs := cdUntilMs - getCurrentTimeMillis()
+		if remainingMs > 0 {
+			cooldown = true
+			cooldownSecs = int((remainingMs + 999) / 1000)
+		} else {
+			cdMessage = ""
+		}
+	}
+
+	return ProgressInfo{
+		IsDownloading:   downloading,
+		MBDownloaded:    progress,
+		SpeedMBps:       speed,
+		RateLimited:     rateLimited,
+		RateLimitSecs:   rateLimitSecs,
+		Cooldown:        cooldown,
+		CooldownSecs:    cooldownSecs,
+		CooldownMessage: cdMessage,
+		CooldownEventID: cdEventID,
+	}
+}
+
+func SetRateLimitCooldown(seconds float64) {
+	rateLimitLock.Lock()
+	if seconds <= 0 {
+		rateLimitUntilMs = 0
+	} else {
+		rateLimitUntilMs = getCurrentTimeMillis() + int64(seconds*1000)
+	}
+	rateLimitLock.Unlock()
+}
+
+func ClearRateLimitCooldown() {
+	rateLimitLock.Lock()
+	rateLimitUntilMs = 0
+	rateLimitLock.Unlock()
+}
+
+func SetCommunityCooldown(seconds float64, message string) {
+	cooldownLock.Lock()
+	if seconds <= 0 {
+		cooldownUntilMs = 0
+		cooldownMessage = ""
+	} else {
+		cooldownUntilMs = getCurrentTimeMillis() + int64(seconds*1000)
+		cooldownMessage = message
+		cooldownEventID++
+	}
+	cooldownLock.Unlock()
+}
+
+func ClearCommunityCooldown() {
+	cooldownLock.Lock()
+	cooldownUntilMs = 0
+	cooldownMessage = ""
+	cooldownLock.Unlock()
 }
 
 func SetDownloadSpeed(mbps float64) {
@@ -110,6 +198,7 @@ func SetDownloading(downloading bool) {
 
 		SetDownloadProgress(0)
 		SetDownloadSpeed(0)
+		ClearRateLimitCooldown()
 	}
 }
 
@@ -147,6 +236,10 @@ func getCurrentTimeMillis() int64 {
 }
 
 func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	if err := CheckDownloadCancelled(); err != nil {
+		return 0, err
+	}
+
 	n, err := pw.writer.Write(p)
 	pw.total += int64(n)
 
@@ -184,7 +277,7 @@ func (pw *ProgressWriter) GetTotal() int64 {
 	return pw.total
 }
 
-func AddToQueue(id, trackName, artistName, albumName, isrc string) {
+func AddToQueue(id, trackName, artistName, albumName, spotifyID string) {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
 
@@ -193,7 +286,7 @@ func AddToQueue(id, trackName, artistName, albumName, isrc string) {
 		TrackName:  trackName,
 		ArtistName: artistName,
 		AlbumName:  albumName,
-		ISRC:       isrc,
+		SpotifyID:  spotifyID,
 		Status:     StatusQueued,
 		Progress:   0,
 		TotalSize:  0,
@@ -394,6 +487,25 @@ func CancelAllQueuedItems() {
 			downloadQueue[i].ErrorMessage = "Cancelled"
 		}
 	}
+}
+
+func CancelQueuedAndDownloadingItems() {
+	downloadQueueLock.Lock()
+	for i := range downloadQueue {
+		if downloadQueue[i].Status == StatusQueued || downloadQueue[i].Status == StatusDownloading {
+			downloadQueue[i].Status = StatusSkipped
+			downloadQueue[i].EndTime = time.Now().Unix()
+			downloadQueue[i].ErrorMessage = "Cancelled"
+		}
+	}
+	downloadQueueLock.Unlock()
+
+	currentItemLock.Lock()
+	currentItemID = ""
+	currentItemLock.Unlock()
+
+	SetDownloadProgress(0)
+	SetDownloadSpeed(0)
 }
 
 func ResetSessionIfComplete() {

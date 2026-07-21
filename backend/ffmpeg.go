@@ -3,7 +3,7 @@ package backend
 import (
 	"archive/tar"
 	"archive/zip"
-	"encoding/base64"
+
 	"fmt"
 	"io"
 	"net/http"
@@ -11,19 +11,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ulikunitz/xz"
+	"golang.org/x/text/unicode/norm"
 )
 
-func decodeBase64(encoded string) (string, error) {
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return "", err
-	}
-	return string(decoded), nil
+type executableCandidate struct {
+	path   string
+	source string
 }
 
 func ValidateExecutable(path string) error {
@@ -65,14 +64,7 @@ func ValidateExecutable(path string) error {
 	return nil
 }
 
-const (
-	ffmpegWindowsURL = "aHR0cHM6Ly9naXRodWIuY29tL0J0Yk4vRkZtcGVnLUJ1aWxkcy9yZWxlYXNlcy9kb3dubG9hZC9sYXRlc3QvZmZtcGVnLW1hc3Rlci1sYXRlc3Qtd2luNjQtZ3BsLnppcA=="
-	ffmpegLinuxURL   = "aHR0cHM6Ly9naXRodWIuY29tL0J0Yk4vRkZtcGVnLUJ1aWxkcy9yZWxlYXNlcy9kb3dubG9hZC9sYXRlc3QvZmZtcGVnLW1hc3Rlci1sYXRlc3QtbGludXg2NC1ncGwudGFyLnh6"
-	ffmpegMacOSURL   = "aHR0cHM6Ly9ldmVybWVldC5jeC9mZm1wZWcvZ2V0cmVsZWFzZS96aXA="
-	ffprobeMacOSURL  = "aHR0cHM6Ly9ldmVybWVldC5jeC9mZm1wZWcvZ2V0cmVsZWFzZS9mZnByb2JlL3ppcA=="
-)
-
-func GetFFmpegDir() (string, error) {
+func GetAppDir() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
@@ -80,70 +72,339 @@ func GetFFmpegDir() (string, error) {
 	return filepath.Join(homeDir, ".spotiflac"), nil
 }
 
-func GetFFmpegPath() (string, error) {
-	ffmpegDir, err := GetFFmpegDir()
+func EnsureAppDir() (string, error) {
+	appDir, err := GetAppDir()
 	if err != nil {
 		return "", err
 	}
 
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create app directory: %w", err)
+	}
+
+	return appDir, nil
+}
+
+func GetFFmpegDir() (string, error) {
+	return EnsureAppDir()
+}
+
+func copyExecutable(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+
+	if err := out.Sync(); err != nil {
+		return err
+	}
+
+	return prepareExecutableForUse(dst)
+}
+
+func appendExecutableCandidate(candidates []executableCandidate, seen map[string]struct{}, path, source string) []executableCandidate {
+	cleanedPath := filepath.Clean(strings.TrimSpace(path))
+	if cleanedPath == "" {
+		return candidates
+	}
+	if _, exists := seen[cleanedPath]; exists {
+		return candidates
+	}
+
+	seen[cleanedPath] = struct{}{}
+	return append(candidates, executableCandidate{
+		path:   cleanedPath,
+		source: source,
+	})
+}
+
+func resolveSystemExecutable(executableName string) string {
+	if runtime.GOOS == "darwin" {
+		candidates := []string{
+			"/opt/homebrew/bin/" + executableName,
+			"/usr/local/bin/" + executableName,
+		}
+		for _, candidate := range candidates {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+
+	if runtime.GOOS != "windows" {
+		path, err := exec.Command("which", executableName).Output()
+		if err == nil {
+			trimmed := strings.TrimSpace(string(path))
+			if trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+
+	path, err := exec.LookPath(executableName)
+	if err == nil {
+		return path
+	}
+
+	return ""
+}
+
+func runExecutableVersionCheck(path string) error {
+	cmd := exec.Command(path, "-version")
+	setHideWindow(cmd)
+	return cmd.Run()
+}
+
+func removeMacOSQuarantineAttribute(path string) error {
+	cmd := exec.Command("xattr", "-d", "com.apple.quarantine", path)
+	setHideWindow(cmd)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+
+	trimmedOutput := strings.TrimSpace(string(output))
+	lowerOutput := strings.ToLower(trimmedOutput)
+	if strings.Contains(lowerOutput, "no such xattr") || strings.Contains(lowerOutput, "attribute not found") {
+		return nil
+	}
+
+	if trimmedOutput != "" {
+		return fmt.Errorf("%w: %s", err, trimmedOutput)
+	}
+
+	return err
+}
+
+func prepareExecutableForUse(path string) error {
+	cleanedPath := filepath.Clean(strings.TrimSpace(path))
+	if cleanedPath == "" {
+		return fmt.Errorf("empty path")
+	}
+
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	if err := os.Chmod(cleanedPath, 0755); err != nil {
+		return fmt.Errorf("failed to mark executable: %w", err)
+	}
+
+	if runtime.GOOS == "darwin" {
+		if err := removeMacOSQuarantineAttribute(cleanedPath); err != nil {
+			fmt.Printf("[FFmpeg] Warning: failed to remove macOS quarantine from %s: %v\n", cleanedPath, err)
+		}
+	}
+
+	return nil
+}
+
+func resolveExecutablePath(executableName string) (string, string, error) {
+	ffmpegDir, err := GetFFmpegDir()
+	if err != nil {
+		return "", "", err
+	}
+
+	localPath := filepath.Join(ffmpegDir, executableName)
+	nextDir := filepath.Join(filepath.Dir(ffmpegDir), ".spotiflac-next")
+	nextPath := filepath.Join(nextDir, executableName)
+	localExists := false
+	candidates := make([]executableCandidate, 0, 3)
+	seen := make(map[string]struct{}, 3)
+
+	if systemPath := resolveSystemExecutable(executableName); systemPath != "" {
+		candidates = appendExecutableCandidate(candidates, seen, systemPath, "system")
+	}
+
+	if _, err := os.Stat(localPath); err == nil {
+		localExists = true
+		candidates = appendExecutableCandidate(candidates, seen, localPath, "local")
+	}
+
+	if !localExists {
+		if _, err := os.Stat(nextPath); err == nil {
+			if copyErr := copyExecutable(nextPath, localPath); copyErr == nil {
+				fmt.Printf("[FFmpeg] Copied %s from SpotiFLAC-Next folder\n", executableName)
+				candidates = appendExecutableCandidate(candidates, seen, localPath, "migrated")
+			}
+		}
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		if candidate.source != "system" {
+			if err := prepareExecutableForUse(candidate.path); err != nil {
+				lastErr = err
+				fmt.Printf("[FFmpeg] Skipping %s %s: %v\n", candidate.source, candidate.path, err)
+				continue
+			}
+		}
+
+		if err := ValidateExecutable(candidate.path); err != nil {
+			lastErr = err
+			fmt.Printf("[FFmpeg] Skipping %s %s: %v\n", candidate.source, candidate.path, err)
+			continue
+		}
+
+		if err := runExecutableVersionCheck(candidate.path); err != nil {
+			lastErr = err
+			fmt.Printf("[FFmpeg] Skipping %s %s: %v\n", candidate.source, candidate.path, err)
+			continue
+		}
+
+		return candidate.path, localPath, nil
+	}
+
+	if len(candidates) > 0 {
+		if lastErr != nil {
+			return "", localPath, fmt.Errorf("no working %s executable found: %w", executableName, lastErr)
+		}
+		return "", localPath, fmt.Errorf("no working %s executable found", executableName)
+	}
+
+	return "", localPath, fmt.Errorf("%s not found in app directory or system path", executableName)
+}
+
+func GetFFmpegPath() (string, error) {
 	ffmpegName := "ffmpeg"
 	if runtime.GOOS == "windows" {
 		ffmpegName = "ffmpeg.exe"
 	}
 
-	return filepath.Join(ffmpegDir, ffmpegName), nil
-}
-
-func GetFFprobePath() (string, error) {
-	ffmpegDir, err := GetFFmpegDir()
+	path, localPath, err := resolveExecutablePath(ffmpegName)
 	if err != nil {
+		if localPath != "" {
+			return localPath, err
+		}
 		return "", err
 	}
 
+	return path, nil
+}
+
+func GetFFprobePath() (string, error) {
 	ffprobeName := "ffprobe"
 	if runtime.GOOS == "windows" {
 		ffprobeName = "ffprobe.exe"
 	}
 
-	ffprobePath := filepath.Join(ffmpegDir, ffprobeName)
-	if _, err := os.Stat(ffprobePath); err == nil {
-		return ffprobePath, nil
+	path, localPath, err := resolveExecutablePath(ffprobeName)
+	if err != nil {
+		if localPath != "" {
+			return localPath, err
+		}
+		return "", err
 	}
 
-	return "", fmt.Errorf("ffprobe not found in app directory")
+	return path, nil
 }
 
 func IsFFprobeInstalled() (bool, error) {
-	ffprobePath, err := GetFFprobePath()
-	if err != nil {
-		return false, nil
-	}
-
-	if err := ValidateExecutable(ffprobePath); err != nil {
-		return false, nil
-	}
-
-	cmd := exec.Command(ffprobePath, "-version")
-	setHideWindow(cmd)
-	err = cmd.Run()
+	_, err := GetFFprobePath()
 	return err == nil, nil
 }
 
 func IsFFmpegInstalled() (bool, error) {
-	ffmpegPath, err := GetFFmpegPath()
-	if err != nil {
-		return false, err
-	}
-
-	if err := ValidateExecutable(ffmpegPath); err != nil {
+	if _, err := GetFFmpegPath(); err != nil {
 		return false, nil
 	}
 
-	cmd := exec.Command(ffmpegPath, "-version")
+	return IsFFprobeInstalled()
+}
 
+func GetBrewPath() string {
+	brewPaths := []string{
+		"/opt/homebrew/bin/brew",
+		"/usr/local/bin/brew",
+	}
+
+	for _, path := range brewPaths {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
+	return ""
+}
+
+func IsBrewFFmpegInstalled() (bool, error) {
+	brewPath := GetBrewPath()
+	if brewPath == "" {
+		return false, nil
+	}
+
+	cmd := exec.Command(brewPath, "list", "ffmpeg")
 	setHideWindow(cmd)
-	err = cmd.Run()
+	err := cmd.Run()
 	return err == nil, nil
+}
+
+func InstallFFmpegWithBrew(progressCallback func(int, string)) error {
+	brewPath := GetBrewPath()
+	if brewPath == "" {
+		return fmt.Errorf("brew not found")
+	}
+
+	progressCallback(10, "Installing FFmpeg via Homebrew...")
+
+	cmd := exec.Command(brewPath, "install", "ffmpeg")
+	setHideWindow(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to install ffmpeg: %w - %s", err, string(output))
+	}
+
+	progressCallback(100, "done")
+
+	return nil
+}
+
+const ffmpegReleaseBaseURL = "https://github.com/spotbye/Dependencies/releases/download/FFmpeg-8.1"
+
+func buildFFmpegReleaseURL(assetName string) string {
+	return ffmpegReleaseBaseURL + "/" + assetName
+}
+
+func getFFmpegDownloadURLs() ([]string, []string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		return []string{buildFFmpegReleaseURL("ffmpeg-windows.zip")}, []string{buildFFmpegReleaseURL("ffprobe-windows.zip")}, nil
+	case "linux":
+		switch runtime.GOARCH {
+		case "amd64":
+			return []string{buildFFmpegReleaseURL("ffmpeg-linux-amd64.zip")}, []string{buildFFmpegReleaseURL("ffprobe-linux-amd64.zip")}, nil
+		case "arm64":
+			return []string{buildFFmpegReleaseURL("ffmpeg-linux-arm64v8.zip")}, []string{buildFFmpegReleaseURL("ffprobe-linux-arm64v8.zip")}, nil
+		default:
+			return nil, nil, fmt.Errorf("unsupported Linux architecture: %s", runtime.GOARCH)
+		}
+	case "darwin":
+		switch runtime.GOARCH {
+		case "amd64":
+			return []string{buildFFmpegReleaseURL("ffmpeg-macos-amd64.zip")}, []string{buildFFmpegReleaseURL("ffprobe-macos-amd64.zip")}, nil
+		case "arm64":
+			return []string{buildFFmpegReleaseURL("ffmpeg-macos-arm64.zip")}, []string{buildFFmpegReleaseURL("ffprobe-macos-arm64.zip")}, nil
+		default:
+			return nil, nil, fmt.Errorf("unsupported macOS architecture: %s", runtime.GOARCH)
+		}
+	default:
+		return nil, nil, fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	}
 }
 
 func DownloadFFmpeg(progressCallback func(int)) error {
@@ -162,63 +423,47 @@ func DownloadFFmpeg(progressCallback func(int)) error {
 		return fmt.Errorf("failed to create ffmpeg directory: %w", err)
 	}
 
-	if runtime.GOOS == "darwin" {
-		ffmpegInstalled, _ := IsFFmpegInstalled()
-		ffprobeInstalled, _ := IsFFprobeInstalled()
+	ffmpegInstalled, _ := IsFFmpegInstalled()
+	ffprobeInstalled, _ := IsFFprobeInstalled()
 
-		if !ffmpegInstalled && !ffprobeInstalled {
+	ffmpegURLs, ffprobeURLs, err := getFFmpegDownloadURLs()
+	if err != nil {
+		return err
+	}
 
-			ffmpegURL, _ := decodeBase64(ffmpegMacOSURL)
-			fmt.Printf("[FFmpeg] Downloading ffmpeg from: %s\n", ffmpegURL)
-			if err := downloadAndExtract(ffmpegURL, ffmpegDir, progressCallback, 0, 50); err != nil {
-				return err
-			}
-
-			ffprobeURL, _ := decodeBase64(ffprobeMacOSURL)
-			fmt.Printf("[FFmpeg] Downloading ffprobe from: %s\n", ffprobeURL)
-			if err := downloadAndExtract(ffprobeURL, ffmpegDir, progressCallback, 50, 100); err != nil {
-				return fmt.Errorf("failed to download ffprobe: %w", err)
-			}
-		} else if !ffmpegInstalled {
-
-			ffmpegURL, _ := decodeBase64(ffmpegMacOSURL)
-			fmt.Printf("[FFmpeg] Downloading ffmpeg from: %s\n", ffmpegURL)
-			if err := downloadAndExtract(ffmpegURL, ffmpegDir, progressCallback, 0, 100); err != nil {
-				return err
-			}
-		} else if !ffprobeInstalled {
-
-			ffprobeURL, _ := decodeBase64(ffprobeMacOSURL)
-			fmt.Printf("[FFmpeg] Downloading ffprobe from: %s\n", ffprobeURL)
-			if err := downloadAndExtract(ffprobeURL, ffmpegDir, progressCallback, 0, 100); err != nil {
-				return fmt.Errorf("failed to download ffprobe: %w", err)
-			}
+	if !ffmpegInstalled && !ffprobeInstalled {
+		if err := downloadWithFallback(ffmpegURLs, ffmpegDir, progressCallback, 0, 50); err != nil {
+			return err
+		}
+		if err := downloadWithFallback(ffprobeURLs, ffmpegDir, progressCallback, 50, 100); err != nil {
+			return err
 		}
 		return nil
 	}
 
-	var encodedURL string
-	switch runtime.GOOS {
-	case "windows":
-		encodedURL = ffmpegWindowsURL
-	case "linux":
-		encodedURL = ffmpegLinuxURL
-	default:
-		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	if !ffmpegInstalled {
+		return downloadWithFallback(ffmpegURLs, ffmpegDir, progressCallback, 0, 100)
 	}
 
-	url, err := decodeBase64(encodedURL)
-	if err != nil {
-		return fmt.Errorf("failed to decode ffmpeg URL: %w", err)
-	}
-
-	fmt.Printf("[FFmpeg] Downloading from: %s\n", url)
-
-	if err := downloadAndExtract(url, ffmpegDir, progressCallback, 0, 100); err != nil {
-		return err
+	if !ffprobeInstalled {
+		return downloadWithFallback(ffprobeURLs, ffmpegDir, progressCallback, 0, 100)
 	}
 
 	return nil
+}
+
+func downloadWithFallback(urls []string, destDir string, progressCallback func(int), start, end int) error {
+	var lastErr error
+	for _, url := range urls {
+		fmt.Printf("[FFmpeg] Trying to download from: %s\n", url)
+		err := downloadAndExtract(url, destDir, progressCallback, start, end)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		fmt.Printf("[FFmpeg] Attempt failed: %v\n", err)
+	}
+	return fmt.Errorf("all download attempts failed: %w", lastErr)
 }
 
 func downloadAndExtract(url, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
@@ -230,7 +475,14 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
-	resp, err := http.Get(url)
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download: %w", err)
 	}
@@ -320,10 +572,13 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 	}
 	fmt.Printf("[FFmpeg] Extracting...\n")
 
-	if strings.HasSuffix(url, ".tar.xz") || runtime.GOOS == "linux" {
+	if strings.HasSuffix(url, ".tar.xz") {
 		return extractTarXz(tmpFile.Name(), destDir)
 	}
-	return extractZip(tmpFile.Name(), destDir)
+	if strings.HasSuffix(url, ".zip") {
+		return extractZip(tmpFile.Name(), destDir)
+	}
+	return fmt.Errorf("unsupported archive format for %s", url)
 }
 
 func extractZip(zipPath, destDir string) error {
@@ -380,6 +635,10 @@ func extractZip(zipPath, destDir string) error {
 
 		if err != nil {
 			return fmt.Errorf("failed to extract file: %w", err)
+		}
+
+		if err := prepareExecutableForUse(destPath); err != nil {
+			return fmt.Errorf("failed to prepare extracted executable: %w", err)
 		}
 
 		fmt.Printf("[FFmpeg] Extracted to: %s\n", destPath)
@@ -459,6 +718,10 @@ func extractTarXz(tarXzPath, destDir string) error {
 			return fmt.Errorf("failed to extract file: %w", err)
 		}
 
+		if err := prepareExecutableForUse(destPath); err != nil {
+			return fmt.Errorf("failed to prepare extracted executable: %w", err)
+		}
+
 		fmt.Printf("[FFmpeg] Extracted to: %s\n", destPath)
 	}
 
@@ -490,6 +753,94 @@ type ConvertAudioResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+func ConvertDownloadedFile(inputFile, outputFormat, bitrate, codec string, deleteOriginal bool) (string, error) {
+	ffmpegPath, err := GetFFmpegPath()
+	if err != nil {
+		return "", fmt.Errorf("failed to get ffmpeg path: %w", err)
+	}
+	if err := ValidateExecutable(ffmpegPath); err != nil {
+		return "", fmt.Errorf("invalid ffmpeg executable: %w", err)
+	}
+
+	inputFile = norm.NFC.String(inputFile)
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	inputExt := strings.ToLower(filepath.Ext(inputFile))
+	outputExt := "." + outputFormat
+	base := strings.TrimSuffix(filepath.Base(inputFile), inputExt)
+	finalOutput := norm.NFC.String(filepath.Join(filepath.Dir(inputFile), base+outputExt))
+	actualOutput := finalOutput
+	if strings.EqualFold(inputExt, outputExt) {
+		actualOutput = filepath.Join(filepath.Dir(inputFile), base+".autoconvert"+outputExt)
+	}
+
+	args := []string{"-i", inputFile, "-map_metadata", "-1", "-map_chapters", "-1", "-y"}
+	switch outputFormat {
+	case "mp3":
+		args = append(args, "-codec:a", "libmp3lame", "-b:a", bitrate, "-map", "0:a", "-id3v2_version", "3")
+	case "m4a":
+		if codec == "alac" {
+			args = append(args, "-codec:a", "alac", "-map", "0:a")
+		} else {
+			args = append(args, "-codec:a", "aac", "-b:a", bitrate, "-map", "0:a")
+		}
+	case "wav", "aiff":
+		pcm := "pcm_s16le"
+		if outputFormat == "aiff" {
+			pcm = "pcm_s16be"
+		}
+		if sampleFmt, _ := pcmSampleFormatForInput(inputFile); sampleFmt == "s32" {
+			if outputFormat == "aiff" {
+				pcm = "pcm_s24be"
+			} else {
+				pcm = "pcm_s24le"
+			}
+		}
+		args = append(args, "-codec:a", pcm, "-map", "0:a")
+	case "opus":
+		args = append(args, "-codec:a", "libopus", "-b:a", bitrate, "-map", "0:a")
+	default:
+		return "", fmt.Errorf("unsupported output format: %s", outputFormat)
+	}
+	args = append(args, actualOutput)
+	cmd := exec.CommandContext(ActiveDownloadContext(), ffmpegPath, args...)
+	setHideWindow(cmd)
+	if output, runErr := cmd.CombinedOutput(); runErr != nil {
+		_ = os.Remove(actualOutput)
+		return "", fmt.Errorf("conversion failed: %v - %s", runErr, output)
+	}
+
+	metadata, _ := ExtractFullMetadataFromFile(inputFile)
+	cover, _ := ExtractCoverArt(inputFile)
+	if cover != "" {
+		defer os.Remove(cover)
+	}
+	lyrics, _ := ExtractLyrics(inputFile)
+	metadata.Lyrics = lyrics
+	if err := EmbedMetadataToConvertedFile(actualOutput, metadata, cover); err != nil {
+		fmt.Printf("[Auto Convert] Warning: metadata: %v\n", err)
+	}
+	if lyrics != "" {
+		_ = EmbedLyricsOnlyUniversal(actualOutput, lyrics)
+	}
+
+	if strings.EqualFold(inputExt, outputExt) {
+		backup := filepath.Join(filepath.Dir(inputFile), base+".autoconvert-backup"+inputExt)
+		_ = os.Remove(backup)
+		if err := os.Rename(inputFile, backup); err != nil {
+			_ = os.Remove(actualOutput)
+			return "", err
+		}
+		if err := os.Rename(actualOutput, finalOutput); err != nil {
+			_ = os.Rename(backup, finalOutput)
+			return "", err
+		}
+		_ = os.Remove(backup)
+	} else if deleteOriginal {
+		_ = os.Remove(inputFile)
+	}
+	return finalOutput, nil
+}
+
 func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 	ffmpegPath, err := GetFFmpegPath()
 	if err != nil {
@@ -509,10 +860,16 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	maxWorkers := min(runtime.NumCPU(), 8)
+	sem := make(chan struct{}, maxWorkers)
+
 	for i, inputFile := range req.InputFiles {
 		wg.Add(1)
 		go func(idx int, inputFile string) {
 			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			result := ConvertAudioResult{
 				InputFile: inputFile,
@@ -536,6 +893,7 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 
 			outputExt := "." + strings.ToLower(req.OutputFormat)
 			outputFile := filepath.Join(outputDir, baseName+outputExt)
+			outputFile = norm.NFC.String(outputFile)
 
 			if inputExt == outputExt {
 				result.Error = "Input and output formats are the same"
@@ -557,7 +915,11 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 				fmt.Printf("[FFmpeg] Warning: Failed to extract metadata from %s: %v\n", inputFile, err)
 			}
 
-			coverArtPath, _ = ExtractCoverArt(inputFile)
+			inputFile = norm.NFC.String(inputFile)
+			coverArtPath, err = ExtractCoverArt(inputFile)
+			if err != nil {
+				fmt.Printf("[FFmpeg] Warning: Failed to extract cover art from %s: %v\n", inputFile, err)
+			}
 			lyrics, err = ExtractLyrics(inputFile)
 			if err != nil {
 				fmt.Printf("[FFmpeg] Warning: Failed to extract lyrics from %s: %v\n", inputFile, err)
@@ -603,6 +965,36 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 						"-map", "0:a",
 					)
 				}
+			case "wav", "aiff":
+				sampleFmt, rawBits := pcmSampleFormatForInput(inputFile)
+				pcmCodec := "pcm_s16le"
+				if req.OutputFormat == "aiff" {
+					pcmCodec = "pcm_s16be"
+				}
+				if sampleFmt == "s32" {
+					if req.OutputFormat == "aiff" {
+						pcmCodec = "pcm_s24be"
+					} else {
+						pcmCodec = "pcm_s24le"
+					}
+				}
+				args = append(args,
+					"-codec:a", pcmCodec,
+					"-map", "0:a",
+				)
+				if rawBits > 0 {
+					args = append(args, "-bits_per_raw_sample", strconv.Itoa(rawBits))
+				}
+			case "opus":
+				bitrate := req.Bitrate
+				if bitrate == "" {
+					bitrate = "192k"
+				}
+				args = append(args,
+					"-codec:a", "libopus",
+					"-b:a", bitrate,
+					"-map", "0:a",
+				)
 			}
 
 			args = append(args, outputFile)
@@ -655,6 +1047,13 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 
 	wg.Wait()
 	return results, nil
+}
+
+func pcmSampleFormatForInput(inputFile string) (sampleFmt string, rawBits int) {
+	if meta, err := GetTrackMetadata(inputFile); err == nil && meta != nil && meta.BitsPerSample > 16 {
+		return "s32", 24
+	}
+	return "s16", 0
 }
 
 type AudioFileInfo struct {

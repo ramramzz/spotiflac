@@ -1,166 +1,39 @@
 package backend
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
-	"math"
 	"os"
-
-	"github.com/go-flac/go-flac"
-	mewflac "github.com/mewkiz/flac"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
 )
 
 type AnalysisResult struct {
-	FilePath      string        `json:"file_path"`
-	FileSize      int64         `json:"file_size"`
-	SampleRate    uint32        `json:"sample_rate"`
-	Channels      uint8         `json:"channels"`
-	BitsPerSample uint8         `json:"bits_per_sample"`
-	TotalSamples  uint64        `json:"total_samples"`
-	Duration      float64       `json:"duration"`
-	BitDepth      string        `json:"bit_depth"`
-	DynamicRange  float64       `json:"dynamic_range"`
-	PeakAmplitude float64       `json:"peak_amplitude"`
-	RMSLevel      float64       `json:"rms_level"`
-	Spectrum      *SpectrumData `json:"spectrum,omitempty"`
+	FilePath      string  `json:"file_path"`
+	FileSize      int64   `json:"file_size"`
+	SampleRate    uint32  `json:"sample_rate"`
+	Channels      uint8   `json:"channels"`
+	BitsPerSample uint8   `json:"bits_per_sample"`
+	TotalSamples  uint64  `json:"total_samples"`
+	Duration      float64 `json:"duration"`
+	Bitrate       int     `json:"bit_rate"`
+	BitDepth      string  `json:"bit_depth"`
+	DynamicRange  float64 `json:"dynamic_range"`
+	PeakAmplitude float64 `json:"peak_amplitude"`
+	RMSLevel      float64 `json:"rms_level"`
 }
 
-func AnalyzeTrack(filepath string) (*AnalysisResult, error) {
-	if !fileExists(filepath) {
-		return nil, fmt.Errorf("file does not exist: %s", filepath)
-	}
-
-	fileInfo, err := os.Stat(filepath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get file info: %w", err)
-	}
-
-	f, err := flac.ParseFile(filepath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse FLAC file: %w", err)
-	}
-
-	result := &AnalysisResult{
-		FilePath: filepath,
-		FileSize: fileInfo.Size(),
-	}
-
-	if len(f.Meta) > 0 {
-		streamInfo := f.Meta[0]
-		if streamInfo.Type == flac.StreamInfo {
-
-			data := streamInfo.Data
-			if len(data) >= 18 {
-
-				result.SampleRate = uint32(data[10])<<12 | uint32(data[11])<<4 | uint32(data[12])>>4
-
-				result.Channels = ((data[12] >> 1) & 0x07) + 1
-
-				result.BitsPerSample = ((data[12]&0x01)<<4 | data[13]>>4) + 1
-
-				result.TotalSamples = uint64(data[13]&0x0F)<<32 |
-					uint64(data[14])<<24 |
-					uint64(data[15])<<16 |
-					uint64(data[16])<<8 |
-					uint64(data[17])
-
-				if result.SampleRate > 0 {
-					result.Duration = float64(result.TotalSamples) / float64(result.SampleRate)
-				}
-
-			}
-		}
-	}
-
-	spectrum, err := AnalyzeSpectrum(filepath)
-	if err != nil {
-
-		fmt.Printf("Warning: failed to analyze spectrum: %v\n", err)
-	} else {
-		result.Spectrum = spectrum
-
-		calculateRealAudioMetrics(result, filepath)
-	}
-
-	result.BitDepth = fmt.Sprintf("%d-bit", result.BitsPerSample)
-
-	return result, nil
-}
-
-func calculateRealAudioMetrics(result *AnalysisResult, filepath string) {
-
-	samples, err := decodeFLACForMetrics(filepath)
-	if err != nil {
-		return
-	}
-
-	var peak float64
-	var sumSquares float64
-
-	for _, sample := range samples {
-		absVal := sample
-		if absVal < 0 {
-			absVal = -absVal
-		}
-		if absVal > peak {
-			peak = absVal
-		}
-		sumSquares += sample * sample
-	}
-
-	peakDB := 20.0 * math.Log10(peak)
-	result.PeakAmplitude = peakDB
-
-	rms := math.Sqrt(sumSquares / float64(len(samples)))
-	rmsDB := 20.0 * math.Log10(rms)
-	result.RMSLevel = rmsDB
-
-	result.DynamicRange = peakDB - rmsDB
-}
-
-func decodeFLACForMetrics(filepath string) ([]float64, error) {
-	stream, err := mewflac.ParseFile(filepath)
-	if err != nil {
-		return nil, err
-	}
-	defer stream.Close()
-
-	maxSamples := 10000000
-	samples := make([]float64, 0, maxSamples)
-
-	for {
-		frame, err := stream.ParseNext()
-		if err != nil {
-			break
-		}
-
-		var channelSamples []int32
-		if len(frame.Subframes) > 0 {
-			channelSamples = frame.Subframes[0].Samples
-		}
-
-		maxVal := float64(int64(1) << (stream.Info.BitsPerSample - 1))
-		for _, sample := range channelSamples {
-			if len(samples) >= maxSamples {
-				return samples, nil
-			}
-			normalized := float64(sample) / maxVal
-			samples = append(samples, normalized)
-		}
-
-		if len(samples) >= maxSamples {
-			break
-		}
-	}
-
-	return samples, nil
-}
-
-func GetFileSize(filepath string) (int64, error) {
-	info, err := os.Stat(filepath)
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
+type AnalysisDecodeResponse struct {
+	PCMBase64     string  `json:"pcm_base64"`
+	SampleRate    uint32  `json:"sample_rate"`
+	Channels      uint8   `json:"channels"`
+	BitsPerSample uint8   `json:"bits_per_sample"`
+	Duration      float64 `json:"duration"`
+	BitrateKbps   int     `json:"bitrate_kbps,omitempty"`
+	BitDepth      string  `json:"bit_depth,omitempty"`
 }
 
 func GetTrackMetadata(filepath string) (*AnalysisResult, error) {
@@ -168,40 +41,174 @@ func GetTrackMetadata(filepath string) (*AnalysisResult, error) {
 		return nil, fmt.Errorf("file does not exist: %s", filepath)
 	}
 
-	fileInfo, err := os.Stat(filepath)
+	return GetMetadataWithFFprobe(filepath)
+}
+
+func GetMetadataWithFFprobe(filePath string) (*AnalysisResult, error) {
+	ffprobePath, err := GetFFprobePath()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get file info: %w", err)
+		return nil, err
 	}
 
-	f, err := flac.ParseFile(filepath)
+	for i := 0; i < 5; i++ {
+		if f, err := os.Open(filePath); err == nil {
+			f.Close()
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	args := []string{
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=sample_rate,channels,bits_per_raw_sample,bits_per_sample,duration,bit_rate",
+		"-of", "default=noprint_wrappers=0",
+		filePath,
+	}
+	cmd := exec.Command(ffprobePath, args...)
+	setHideWindow(cmd)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse FLAC file: %w", err)
+		return nil, fmt.Errorf("ffprobe failed: %v - %s", err, string(output))
 	}
 
-	result := &AnalysisResult{
-		FilePath: filepath,
-		FileSize: fileInfo.Size(),
-	}
-
-	if len(f.Meta) > 0 {
-		streamInfo := f.Meta[0]
-		if streamInfo.Type == flac.StreamInfo {
-			data := streamInfo.Data
-			if len(data) >= 18 {
-				result.SampleRate = uint32(data[10])<<12 | uint32(data[11])<<4 | uint32(data[12])>>4
-				result.BitsPerSample = ((data[12]&0x01)<<4 | data[13]>>4) + 1
-				result.TotalSamples = uint64(data[13]&0x0F)<<32 |
-					uint64(data[14])<<24 |
-					uint64(data[15])<<16 |
-					uint64(data[16])<<8 |
-					uint64(data[17])
-
-				if result.SampleRate > 0 {
-					result.Duration = float64(result.TotalSamples) / float64(result.SampleRate)
-				}
-			}
+	infoMap := make(map[string]string)
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			infoMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
 	}
-	result.BitDepth = fmt.Sprintf("%d-bit", result.BitsPerSample)
-	return result, nil
+
+	res := &AnalysisResult{
+		FilePath: filePath,
+	}
+
+	if info, err := os.Stat(filePath); err == nil {
+		res.FileSize = info.Size()
+	}
+
+	if val, ok := infoMap["sample_rate"]; ok {
+		s, _ := strconv.Atoi(val)
+		res.SampleRate = uint32(s)
+	}
+	if val, ok := infoMap["channels"]; ok {
+		c, _ := strconv.Atoi(val)
+		res.Channels = uint8(c)
+	}
+	if val, ok := infoMap["duration"]; ok {
+		d, _ := strconv.ParseFloat(val, 64)
+		res.Duration = d
+	}
+	if val, ok := infoMap["bit_rate"]; ok && val != "N/A" {
+		br, _ := strconv.Atoi(val)
+		res.Bitrate = br
+	}
+
+	bits := 0
+	if val, ok := infoMap["bits_per_raw_sample"]; ok && val != "N/A" {
+		bits, _ = strconv.Atoi(val)
+	}
+	if bits == 0 {
+		if val, ok := infoMap["bits_per_sample"]; ok && val != "N/A" {
+			bits, _ = strconv.Atoi(val)
+		}
+	}
+
+	res.BitsPerSample = uint8(bits)
+	if bits > 0 {
+		res.BitDepth = fmt.Sprintf("%d-bit", bits)
+	} else {
+		res.BitDepth = "Unknown"
+	}
+
+	return res, nil
+}
+
+func DecodeAudioForAnalysis(filePath string) (*AnalysisDecodeResponse, error) {
+	metadata, err := GetTrackMetadata(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	pcmBase64, err := extractAnalysisPCMBase64(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &AnalysisDecodeResponse{
+		PCMBase64:     pcmBase64,
+		SampleRate:    metadata.SampleRate,
+		Channels:      metadata.Channels,
+		BitsPerSample: metadata.BitsPerSample,
+		Duration:      metadata.Duration,
+		BitDepth:      metadata.BitDepth,
+	}
+
+	if metadata.Bitrate > 0 {
+		resp.BitrateKbps = metadata.Bitrate / 1000
+	}
+
+	return resp, nil
+}
+
+func extractAnalysisPCMBase64(filePath string) (string, error) {
+	ffmpegPath, err := GetFFmpegPath()
+	if err != nil {
+		return "", err
+	}
+
+	argSets := [][]string{
+		{
+			"-v", "error",
+			"-i", filePath,
+			"-vn",
+			"-map", "0:a:0",
+			"-af", "pan=mono|c0=c0",
+			"-f", "s16le",
+			"-acodec", "pcm_s16le",
+			"pipe:1",
+		},
+		{
+			"-v", "error",
+			"-i", filePath,
+			"-vn",
+			"-map", "0:a:0",
+			"-ac", "1",
+			"-f", "s16le",
+			"-acodec", "pcm_s16le",
+			"pipe:1",
+		},
+	}
+
+	var lastErr error
+
+	for _, args := range argSets {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+
+		cmd := exec.Command(ffmpegPath, args...)
+		setHideWindow(cmd)
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		if err := cmd.Run(); err != nil {
+			lastErr = fmt.Errorf("ffmpeg analysis decode failed: %w - %s", err, strings.TrimSpace(stderr.String()))
+			continue
+		}
+
+		if stdout.Len() == 0 {
+			lastErr = fmt.Errorf("ffmpeg analysis decode returned empty PCM output")
+			continue
+		}
+
+		return base64.StdEncoding.EncodeToString(stdout.Bytes()), nil
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+
+	return "", fmt.Errorf("ffmpeg analysis decode failed")
 }

@@ -50,11 +50,27 @@ func SelectFolderDialog(ctx context.Context, defaultPath string) (string, error)
 
 func SelectFileDialog(ctx context.Context) (string, error) {
 	options := wailsRuntime.OpenDialogOptions{
-		Title: "Select FLAC File for Analysis",
+		Title: "Select Audio File for Analysis",
 		Filters: []wailsRuntime.FileFilter{
+			{
+				DisplayName: "Audio Files (*.flac;*.mp3;*.m4a;*.aac)",
+				Pattern:     "*.flac;*.mp3;*.m4a;*.aac",
+			},
 			{
 				DisplayName: "FLAC Audio Files (*.flac)",
 				Pattern:     "*.flac",
+			},
+			{
+				DisplayName: "MP3 Audio Files (*.mp3)",
+				Pattern:     "*.mp3",
+			},
+			{
+				DisplayName: "M4A Audio Files (*.m4a)",
+				Pattern:     "*.m4a",
+			},
+			{
+				DisplayName: "AAC Audio Files (*.aac)",
+				Pattern:     "*.aac",
 			},
 			{
 				DisplayName: "All Files (*.*)",
@@ -73,4 +89,27 @@ func SelectFileDialog(ctx context.Context) (string, error) {
 	}
 
 	return selectedFile, nil
+}
+
+func SelectImageVideoDialog(ctx context.Context) ([]string, error) {
+	options := wailsRuntime.OpenDialogOptions{
+		Title: "Select Image or Video",
+		Filters: []wailsRuntime.FileFilter{
+			{
+				DisplayName: "Supported Files (*.jpg, *.png, *.mp4, *.mov, ...)",
+				Pattern:     "*.jpg;*.jpeg;*.png;*.gif;*.webp;*.mp4;*.mkv;*.webm;*.mov",
+			},
+			{
+				DisplayName: "All Files (*.*)",
+				Pattern:     "*.*",
+			},
+		},
+	}
+
+	selectedPaths, err := wailsRuntime.OpenMultipleFilesDialog(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+
+	return selectedPaths, nil
 }

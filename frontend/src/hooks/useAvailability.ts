@@ -2,25 +2,23 @@ import { useState, useCallback } from "react";
 import { CheckTrackAvailability } from "../../wailsjs/go/main/App";
 import type { TrackAvailability } from "@/types/api";
 import { logger } from "@/lib/logger";
+import { CHECK_TIMEOUT_MS, withTimeout } from "@/lib/async-timeout";
 export function useAvailability() {
     const [checking, setChecking] = useState(false);
     const [checkingTrackId, setCheckingTrackId] = useState<string | null>(null);
     const [availabilityMap, setAvailabilityMap] = useState<Map<string, TrackAvailability>>(new Map());
     const [error, setError] = useState<string | null>(null);
-    const checkAvailability = useCallback(async (spotifyId: string, isrc?: string) => {
+    const checkAvailability = useCallback(async (spotifyId: string) => {
         if (!spotifyId) {
             setError("No Spotify ID provided");
             return null;
-        }
-        if (availabilityMap.has(spotifyId)) {
-            return availabilityMap.get(spotifyId)!;
         }
         setChecking(true);
         setCheckingTrackId(spotifyId);
         setError(null);
         try {
             logger.info(`Checking availability for track: ${spotifyId}`);
-            const response = await CheckTrackAvailability(spotifyId, isrc || "");
+            const response = await withTimeout(CheckTrackAvailability(spotifyId), CHECK_TIMEOUT_MS, `Availability check timed out after 10 seconds for ${spotifyId}`);
             const availability: TrackAvailability = JSON.parse(response);
             setAvailabilityMap((prev) => {
                 const newMap = new Map(prev);
@@ -40,7 +38,7 @@ export function useAvailability() {
             setChecking(false);
             setCheckingTrackId(null);
         }
-    }, [availabilityMap]);
+    }, []);
     const getAvailability = useCallback((spotifyId: string) => {
         return availabilityMap.get(spotifyId);
     }, [availabilityMap]);

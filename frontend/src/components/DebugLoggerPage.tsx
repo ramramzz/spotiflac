@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef } from "react";
-import { Trash2, Copy, Check } from "lucide-react";
+import { Trash2, Copy, Check, FileDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { logger, type LogEntry } from "@/lib/logger";
+import { useDownloadQueueData } from "@/hooks/useDownloadQueueData";
+import { ExportFailedDownloads } from "../../wailsjs/go/main/App";
+import { toastWithSound as toast } from "@/lib/toast-with-sound";
 const levelColors: Record<string, string> = {
     info: "text-blue-500",
     success: "text-green-500",
@@ -21,6 +24,13 @@ export function DebugLoggerPage() {
     const [logs, setLogs] = useState<LogEntry[]>([]);
     const [copied, setCopied] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
+    const queueInfo = useDownloadQueueData();
+    const hasDownloadActivity = queueInfo.queue.length > 0 ||
+        queueInfo.queued_count > 0 ||
+        queueInfo.completed_count > 0 ||
+        queueInfo.failed_count > 0 ||
+        queueInfo.skipped_count > 0;
+    const canExportFailed = hasDownloadActivity && queueInfo.failed_count > 0;
     useEffect(() => {
         const unsubscribe = logger.subscribe(() => {
             setLogs(logger.getLogs());
@@ -51,10 +61,32 @@ export function DebugLoggerPage() {
             console.error("Failed to copy logs:", err);
         }
     };
+    const handleExportFailed = async () => {
+        if (!canExportFailed) {
+            return;
+        }
+        try {
+            const message = await ExportFailedDownloads();
+            if (message.startsWith("Successfully")) {
+                toast.success(message);
+            }
+            else if (message !== "Export cancelled") {
+                toast.info(message);
+            }
+        }
+        catch (error) {
+            console.error("Failed to export:", error);
+            toast.error(`Failed to export: ${error}`);
+        }
+    };
     return (<div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Debug Logs</h1>
         <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" className="gap-1.5" onClick={handleExportFailed} disabled={!canExportFailed}>
+            <FileDown className="h-4 w-4"/>
+            Export Failed
+          </Button>
           <Button variant="outline" size="sm" className="gap-1.5" onClick={handleCopy} disabled={logs.length === 0}>
             {copied ? <Check className="h-4 w-4"/> : <Copy className="h-4 w-4"/>}
             Copy
